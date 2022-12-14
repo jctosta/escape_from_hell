@@ -2,12 +2,31 @@
 name = "escape_from_hell"
 version = "0.1.0"
 edition = "2021"
+authors = ["Carlos Tosta <jctosta86@gmail.com>"]
+readme = "README.md"
+repository = "https://github.com/jctosta/escape_from_hell"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Enable high optimizations for dependencies (incl. Bevy), but not for our code:
+[profile.dev.package.my-game]
+opt-level = 0
+[profile.dev.package."*"]
+opt-level = 3
+
+# Optimizations for WASM
+[profile.release]
+panic = 'abort'
+codegen-units = 1
+opt-level = 'z'
+lto = true
 
 [dependencies]
 bevy = "0.9.1"
 bevy-inspector-egui = "0.14.0"
+bevy_egui = "0.18.0"
+bevy_kira_audio = "0.13.0"
 bevy_rapier2d = "0.19.0"
 leafwing-input-manager = "0.7.1"
 rand = "0.8.5"

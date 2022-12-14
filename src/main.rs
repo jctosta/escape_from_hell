@@ -1,129 +1,208 @@
-use bevy::{prelude::*, core_pipeline::bloom::BloomSettings, time::FixedTimestep};
+use bevy::{
+    diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin},
+    prelude::*,
+    time::FixedTimestep,
+};
+// use bevy_inspector_egui::{WorldInspectorParams, WorldInspectorPlugin};
+use bevy_egui::{
+    egui::{self, Color32},
+    EguiContext, EguiPlugin,
+};
+use bevy_kira_audio::{prelude::*, Audio};
 use bevy_rapier2d::prelude::*;
 use leafwing_input_manager::prelude::*;
-use bevy_inspector_egui::{WorldInspectorPlugin};
 use rand::prelude::*;
-
-fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            window: WindowDescriptor { 
-                width: 800.0, 
-                height: 600.0, 
-                title: "Escape From Hell".into(),
-                ..default()
-            },
-            ..default()
-        }))
-        .add_plugin(InputManagerPlugin::<Action>::default())
-        .add_plugin(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
-        .add_plugin(WorldInspectorPlugin::new())
-        .insert_resource(RapierConfiguration {
-            gravity: Vec2::ZERO,
-            ..default()
-        })
-        .insert_resource(ClearColor(Color::MIDNIGHT_BLUE))
-        .add_event::<BulletSpawnEvent>()
-        .add_event::<BulletDespawnEvent>()
-        .add_startup_system(setup)
-        .add_system(movement)
-        .add_system(dash)
-        .add_system(shoot)
-        .add_system(spawn_bullet)
-        .add_system(bullet_timeout_system)
-        .add_system_set(
-            SystemSet::new()
-                .with_run_criteria(FixedTimestep::step(10.))
-                .with_system(spawn_enemies)
-        )
-        .add_system_set(
-            SystemSet::new()
-                .with_run_criteria(FixedTimestep::step(1.))
-                .with_system(move_enemies)   
-        )
-        .run();
-}
-
-
-
-#[derive(Component)]
-struct Player;
+use std::time::Duration;
 
 #[derive(Actionlike, PartialEq, Eq, Clone, Copy, Hash, Debug)]
 enum Action {
     Move,
-    Shoot,
-    Dash,
 }
 
+#[derive(Component)]
+struct Player {
+    move_speed: f32,
+    life: u64,
+}
+
+#[derive(Component)]
+struct GameTime {
+    seconds: u64,
+}
+
+#[derive(Component)]
+struct FpsText;
+
+#[derive(Component)]
+struct PlayerLife;
+
+#[derive(Component)]
+struct Enemy {
+    move_speed: f32,
+}
+
+struct GameOverEvent(Entity);
+
+const WINDOW_WIDTH: f32 = 1024.0;
+const WINDOW_HEIGHT: f32 = 768.0;
+
+const COLOR_ACCENT: Color = Color::rgb(199.0 / 255.0, 36.0 / 255.0, 177.0 / 255.0);
+const COLOR_BACKGROUND: Color = Color::rgb(58.0 / 255.0, 58.0 / 255.0, 89.0 / 255.0);
+const COLOR_ACCENT_INVERSE: Color = Color::rgb(113.0 / 255.0, 219.0 / 255.0, 212.0 / 255.0);
+const COLOR_NEUTRAL: Color = Color::rgb(179.0 / 255.0, 176.0 / 255.0, 196.0 / 255.0);
+const COLOR_YELLOW: Color = Color::rgb(1.0, 211.0 / 255.0, 25.0 / 255.0);
+const COLOR_RED: Color = Color::rgb(1.0, 41.0 / 255.0, 117.0 / 255.0);
+
 fn spawn_player(commands: &mut Commands, asset_server: &Res<AssetServer>) {
-    commands
-        .spawn(
-            SpriteBundle {
-                transform: Transform::from_translation(Vec2::new(0.0, 0.0).extend(1.0)),
-                texture: asset_server.load("ship_H.png"),
+    commands.spawn((
+        SpriteBundle {
+            texture: asset_server.load("ship_I.png"),
+            transform: Transform::from_translation(Vec2::new(0.0, 0.0).extend(1.0)),
+            sprite: Sprite {
+                color: COLOR_ACCENT,
                 ..default()
-            }
-        )
-        .insert(InputManagerBundle::<Action> {
+            },
+            ..default()
+        },
+        InputManagerBundle::<Action> {
             action_state: ActionState::default(),
             input_map: InputMap::default()
                 .insert(DualAxis::left_stick(), Action::Move)
                 .insert(VirtualDPad::wasd(), Action::Move)
                 .insert(VirtualDPad::arrow_keys(), Action::Move)
-                .insert(KeyCode::Space, Action::Shoot)
-                .insert(KeyCode::E, Action::Dash)
                 .set_gamepad(Gamepad { id: 0 })
                 .build(),
-        })
-        .insert(Player)
-        .insert(RigidBody::Dynamic)
-        .insert(Collider::ball(32.0))
-        .insert(ExternalForce {
-            force: Vec2::ZERO,
-            torque: 0.0,
-        })
-        .insert(ExternalImpulse {
-            impulse: Vec2::ZERO,
-            torque_impulse: 0.0,
-        })
-        .insert(Damping {
+        },
+        Player {
+            move_speed: 300.0,
+            life: 10,
+        },
+        RigidBody::Dynamic,
+        Velocity::zero(),
+        Collider::ball(20.0),
+        ActiveEvents::CONTACT_FORCE_EVENTS,
+        Restitution::coefficient(1.0),
+        Ccd::enabled(),
+        Damping {
             linear_damping: 0.6,
             angular_damping: 5.0,
-        })
-        .insert(Restitution::coefficient(1.0))
-        .insert((
-            Camera2dBundle {
-                camera: Camera {
-                    hdr: true,
-                    ..default()
-                },
-                ..default()
-            },
-            BloomSettings {
-                intensity: 1.0,
-                ..default()
-            }
-        ));
-
+        },
+        ExternalForce {
+            force: Vec2::ZERO,
+            torque: 0.0,
+        },
+    ));
 }
 
-const MOVE_FORCE: f32 = 3000.0;
+fn player_movement(
+    mut query: Query<(&ActionState<Action>, &mut Transform), With<Player>>,
+    player_query: Query<&Player>,
+    time: Res<Time>,
+) {
+    let player = player_query.single();
+    for (action_state, mut transform) in &mut query {
+        let axis_vector = action_state.clamped_axis_pair(Action::Move).unwrap();
+        let movement = Vec2::new(axis_vector.x(), axis_vector.y());
 
-fn movement(mut query: Query<(&ActionState<Action>, &mut ExternalForce), With<Player>>, time: Res<Time>) {
-    for (action_state, mut external_force) in &mut query {
-        let axis_vector = action_state.clamped_axis_pair(Action::Move).unwrap().xy();
-        external_force.force = axis_vector * MOVE_FORCE * time.delta_seconds(); 
+        let rotate_player =
+            Quat::from_rotation_arc(Vec3::Y, movement.extend(0.0).normalize_or_zero());
+        transform.rotation = rotate_player;
+
+        transform.translation += movement.extend(0.0) * time.delta_seconds() * player.move_speed;
+
+        // Clamp player to window
+        transform.translation.x = transform.translation.x.clamp(-(WINDOW_WIDTH / 2.0), WINDOW_WIDTH / 2.0);
+        transform.translation.y = transform.translation.y.clamp(-(WINDOW_HEIGHT / 2.0), WINDOW_HEIGHT / 2.0);
     }
 }
 
-fn dash(mut query: Query<(&ActionState<Action>, &mut ExternalImpulse), With<Player>>, time: Res<Time>) {
-    for (action_state, mut external_impulse) in &mut query {
-        let pressed = action_state.just_pressed(Action::Dash);
-        if pressed {
-            external_impulse.impulse = Vec2::new(0.0, 2.0) * MOVE_FORCE * time.delta_seconds();
-        }
-        // @TODO: Add logic to limit the number of dashes a user can make
+fn spawn_enemy_group(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let mut rng = rand::thread_rng();
+    let group_size = 3;
+    let mut enemy_count = 0;
+
+    let colors = [COLOR_ACCENT_INVERSE, COLOR_YELLOW, COLOR_RED];
+    let images: [Handle<Image>; 3] = [
+        asset_server.load("enemy_B.png"),
+        asset_server.load("enemy_D.png"),
+        asset_server.load("enemy_E.png")
+    ];
+
+    while enemy_count < group_size {
+        let x: f32 = rng.gen_range(-200.0..200.0);
+        let y: f32 = rng.gen_range(0.0..200.0);
+
+        let enemy_type: usize = rng.gen_range(0..3);
+
+        let selected_color = colors[enemy_type].clone();
+        let selected_sprite = images[enemy_type].clone();
+
+        spawn_enemy(
+            Vec3::new(x, y, 1.0),
+            selected_color,
+            selected_sprite,
+            &mut commands,
+        );
+
+        enemy_count += 1;
+    }
+}
+
+fn spawn_enemy(
+    position: Vec3,
+    color: Color,
+    texture: Handle<Image>,
+    commands: &mut Commands,
+) {
+    commands.spawn((
+        SpriteBundle {
+            texture,
+            transform: Transform::from_translation(position),
+            sprite: Sprite { color, ..default() },
+            ..default()
+        },
+        Enemy { move_speed: 50.0 },
+        RigidBody::Dynamic,
+        Velocity::zero(),
+        Collider::ball(20.0),
+        ActiveEvents::CONTACT_FORCE_EVENTS,
+        Restitution::coefficient(1.0),
+        Ccd::enabled(),
+        Damping {
+            linear_damping: 0.6,
+            angular_damping: 5.0,
+        },
+        ExternalForce {
+            force: Vec2::ZERO,
+            torque: 0.0,
+        },
+    ));
+}
+
+type OnlyEnemies = (With<Enemy>, Without<Player>);
+type OnlyPlayer = (With<Player>, Without<Enemy>);
+
+fn enemy_movement(
+    mut query: Query<(&mut Transform, &Enemy), OnlyEnemies>,
+    player_query: Query<&Transform, OnlyPlayer>,
+    time: Res<Time>,
+) {
+    // let min = Vec3::new(-(WINDOW_WIDTH / 2.0), WINDOW_HEIGHT / 2.0, 1.0);
+    // let max = Vec3::new(WINDOW_WIDTH / 2.0, -(WINDOW_HEIGHT / 2.0), 1.0);
+    let player_transform = player_query.single();
+    for (mut enemy_transform, enemy) in query.iter_mut() {
+        // get player direction
+        let angle =
+            (player_transform.translation - enemy_transform.translation).normalize_or_zero();
+        // rotate enemy to face player
+        let rotate_to_player = Quat::from_rotation_arc(Vec3::Y, angle);
+        enemy_transform.rotation = rotate_to_player;
+        // move enemy to player
+        enemy_transform.translation += angle * time.delta_seconds() * (enemy.move_speed + time.elapsed_seconds());
+
+        // Clamp enemy to window
+        enemy_transform.translation.x = enemy_transform.translation.x.clamp(-(WINDOW_WIDTH / 2.0), WINDOW_WIDTH / 2.0);
+        enemy_transform.translation.y = enemy_transform.translation.y.clamp(-(WINDOW_HEIGHT / 2.0), WINDOW_HEIGHT / 2.0);
     }
 }
 
@@ -140,142 +219,222 @@ fn spawn_star(location: Vec2, rotation: f32, commands: &mut Commands, asset_serv
             rotation: Quat::from_rotation_z(rotation),
             ..default()
         },
+        sprite: Sprite {
+            color: COLOR_NEUTRAL.as_rgba().set_a(0.1).clone(),
+            ..default()
+        },
         ..default()
     }).insert(Star);
-}
-
-
-// ******** Bullet Logic *********
-// @TODO: Move this logic to another file
-#[derive(Component)]
-struct Bullet {
-    despawn_timer: Timer
-}
-
-struct BulletSpawnEvent {
-    transform: Transform,
-    velocity: Velocity,
-}
-
-struct BulletDespawnEvent(Entity);
-
-
-fn shoot(mut query: Query<(&ActionState<Action>, &Transform), With<Player>>, mut ev_shoot: EventWriter<BulletSpawnEvent>) {
-    
-    for (action_state, transform) in query.iter_mut() {
-        let pressed = action_state.just_pressed(Action::Shoot);
-        if pressed {
-            ev_shoot.send(BulletSpawnEvent { 
-                transform: transform.clone(), 
-                velocity: Velocity::linear(Vec2::new(0.0, 300.0)) });
-        }
-    }
-}
-
-fn spawn_bullet(mut bullet_spawn_event: EventReader<BulletSpawnEvent>, mut commands: Commands, asset_server: Res<AssetServer>) {
-    let bullet_handle = asset_server.load("star_tiny.png");
-
-    for spawn_event in bullet_spawn_event.iter() {
-        let transform = spawn_event.transform;
-        let velocity = spawn_event.velocity;
-        commands.spawn((
-            SpriteBundle {
-                texture: bullet_handle.clone(),
-                transform: Transform {
-                    translation: transform.translation,
-                    ..default()
-                },
-                ..default()
-            },
-            Bullet {
-                despawn_timer: Timer::from_seconds(5.0, TimerMode::Once),
-            },
-            RigidBody::Dynamic,
-            Collider::ball(2.5),
-            velocity,
-            Sensor,
-            ActiveEvents::COLLISION_EVENTS,
-        ));
-    }
-    
-}
-
-fn bullet_timeout_system(mut commands: Commands, time: Res<Time>, mut query: Query<(Entity, &mut Bullet)>) {
-    for (entity, mut bullet) in query.iter_mut() {
-        bullet.despawn_timer.tick(time.delta());
-        if bullet.despawn_timer.finished() {
-            commands.entity(entity).despawn();
-        }
-    }
 }
 
 fn spawn_stars(mut commands: Commands, asset_server: Res<AssetServer>) {
     let mut rng = rand::thread_rng();
     let mut star_count = 0;
-    while star_count < 1000 {
-        let x: f32 = rng.gen_range(-150.0..150.0);
-        let y: f32 = rng.gen_range(0.0..50000.0);
+    while star_count < 100 {
+        let x: f32 = rng.gen_range(-(WINDOW_WIDTH / 2.0)..(WINDOW_WIDTH / 2.0));
+        let y: f32 = rng.gen_range(-(WINDOW_HEIGHT / 2.0)..(WINDOW_HEIGHT / 2.0));
         spawn_star(Vec2::new(x, y), 0.0, &mut commands, &asset_server);
         star_count = star_count + 1;
     }
 }
 
-#[derive(Component)]
-struct Enemy;
 
-fn spawn_enemy(location: Vec2, rotation: f32, commands: &mut Commands, asset_server: &Res<AssetServer>) {
-    let enemy_handle = asset_server.load("enemy_A.png");
-    commands.spawn((
-        SpriteBundle {
-            texture: enemy_handle.clone(),
-            transform: Transform {
-                translation: location.extend(0.0),
-                rotation: Quat::from_rotation_z(rotation),
-                ..default()
-            },
-            ..default()
-        },
-        RigidBody::Dynamic,
-        Collider::ball(2.5),
-        Velocity::linear(Vec2::new(1.0, 1.0)),
-        Sensor,
-        ActiveEvents::COLLISION_EVENTS,
-    )).insert(Enemy);
+fn update_game_time(mut query: Query<(&mut Text, &mut GameTime), With<GameTime>>) {
+    let (mut game_time_text, mut game_time) = query.single_mut();
+    game_time.seconds += 1;
+    let new_duration = Duration::new(game_time.seconds, 0);
+    // let seconds = new_duration.as_secs() % 60;
+    let seconds = (new_duration.as_secs() / 60) % 60;
+    let minutes = (new_duration.as_secs() / 60) / 60;
+    let seconds_display = if seconds < 10 {
+        format!("0{}", seconds)
+    } else {
+        format!("{}", seconds)
+    };
+    let minutes_display = if minutes < 10 {
+        format!("0{}", minutes)
+    } else {
+        format!("{}", minutes)
+    };
+    game_time_text.sections[0].value = format!("{}:{}", minutes_display, seconds_display);
 }
 
-fn spawn_enemies(mut commands: Commands, asset_server: Res<AssetServer>, mut query: Query<&Transform, With<Player>>) {
-    for (transform) in query.iter_mut() {
-        // println!("{:?}", transform);
-
-        let mut rng = rand::thread_rng();
-        let mut enemies_count = 0;
-        while enemies_count < 10 {
-            let x: f32 = rng.gen_range(-200.0..200.0);
-            let y: f32 = rng.gen_range(-200.0..200.0);
-
-            let final_x = transform.translation.x + x + 100.0;
-            let final_y = transform.translation.y + y + 100.0;
-            spawn_enemy(Vec2::new(final_x, final_y), 0.0, &mut commands, &asset_server);
-            enemies_count = enemies_count + 1;
+fn update_fps(diagnostics: Res<Diagnostics>, mut query: Query<&mut Text, With<FpsText>>) {
+    for mut text in &mut query {
+        if let Some(fps) = diagnostics.get(FrameTimeDiagnosticsPlugin::FPS) {
+            if let Some(value) = fps.smoothed() {
+                text.sections[1].value = format!("{value:.2}");
+            }
         }
     }
 }
 
-fn move_enemies(mut enemy_query: Query<(&mut Velocity), With<Enemy>>, time: Res<Time>, mut player_query: Query<&Transform, With<Player>>) {
-    let player_transform = player_query.single_mut();
-    for mut enemy_velocity in enemy_query.iter_mut() {
-        enemy_velocity.linvel = Vec2::new(100.0, 200.0);
-        enemy_velocity.angvel = 10.0;
+fn update_player_health(mut query: Query<&mut Text, With<PlayerLife>>, player_query: Query<&Player>) {
+    let player = player_query.single();
+    for mut text in &mut query {
+        text.sections[1].value = format!("{}", player.life);
     }
 }
 
-// Game Initial Setup
+fn configure_visuals(mut egui_ctx: ResMut<EguiContext>) {
+    egui_ctx.ctx_mut().set_visuals(egui::Visuals {
+        window_rounding: 0.0.into(),
+        panel_fill: Color32::LIGHT_GREEN,
+        ..Default::default()
+    });
+}
+
+fn start_background_audio(asset_server: Res<AssetServer>, audio: Res<Audio>) {
+    audio
+        .play(asset_server.load("music/Ludum_Dare_28_Track_1.ogg"))
+        .with_volume(0.5)
+        .looped();
+}
+
+fn player_contact(
+    mut player_entity_query: Query<(Entity, &mut Player), With<Player>>,
+    mut contact_event: EventReader<ContactForceEvent>,
+    mut game_over_event: EventWriter<GameOverEvent>,
+) {
+    let (player_entity, mut player) = player_entity_query.single_mut();
+    for contact_event in contact_event.iter() {
+        if contact_event.collider1 == player_entity || contact_event.collider2 == player_entity {
+            info!("Player collided");
+            if player.life > 0 {
+                player.life -= 1;
+            } else {
+                game_over_event.send(GameOverEvent(player_entity));
+            }
+        }
+    }
+}
+
+fn handle_game_over(mut game_over_event: EventReader<GameOverEvent>) {
+    for evt in game_over_event.iter() {
+        info!("Entity {:?} lost the game", evt.0);
+    }
+}
+
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    
-    // Spawn Player
+    commands.spawn(Camera2dBundle {
+        camera: Camera { ..default() },
+        ..default()
+    });
+
+    commands.spawn((
+        TextBundle::from_section(
+            "00:00",
+            TextStyle {
+                font: asset_server.load("fonts/Minecraft.otf"),
+                font_size: 30.0,
+                color: Color::WHITE,
+            },
+        )
+        .with_text_alignment(TextAlignment::TOP_CENTER)
+        .with_style(Style {
+            position_type: PositionType::Absolute,
+            position: UiRect {
+                top: Val::Px(5.0),
+                right: Val::Px(15.0),
+                ..default()
+            },
+            ..default()
+        }),
+        GameTime { seconds: 0 },
+    ));
+
+    commands.spawn((
+        TextBundle::from_sections([
+            TextSection::new(
+                "FPS: ",
+                TextStyle {
+                    font: asset_server.load("fonts/Minecraft-Bold.otf"),
+                    font_size: 10.0,
+                    color: COLOR_ACCENT,
+                },
+            ),
+            TextSection::from_style(TextStyle {
+                font: asset_server.load("fonts/Minecraft.otf"),
+                font_size: 10.0,
+                color: COLOR_ACCENT,
+            }),
+        ]),
+        FpsText,
+    ));
+
+    commands.spawn((
+        TextBundle::from_sections([
+            TextSection::new(
+                "Health: ",
+                TextStyle {
+                    font: asset_server.load("fonts/Minecraft-Bold.otf"),
+                    font_size: 30.0,
+                    color: COLOR_ACCENT,
+                },
+            ),
+            TextSection::from_style(TextStyle {
+                font: asset_server.load("fonts/Minecraft.otf"),
+                font_size: 30.0,
+                color: COLOR_ACCENT,
+            }),
+        ])
+        .with_text_alignment(TextAlignment::BOTTOM_CENTER)
+        .with_style(Style {
+            position_type: PositionType::Absolute,
+            position: UiRect {
+                bottom: Val::Px(10.0),
+                left: Val::Px(10.0),
+                ..default()
+            },
+            ..default()
+        }),
+        PlayerLife,
+    ));
+
     spawn_player(&mut commands, &asset_server);
 
     // Spawn Stars
     spawn_stars(commands, asset_server);
+}
 
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            window: WindowDescriptor {
+                width: WINDOW_WIDTH,
+                height: WINDOW_HEIGHT,
+                title: "Escape from Hell".into(),
+                canvas: Some("#bevy".to_owned()),
+                ..default()
+            },
+            ..default()
+        }))
+        .add_plugin(InputManagerPlugin::<Action>::default())
+        .add_plugin(AudioPlugin)
+        .add_plugin(EguiPlugin)
+        .add_plugin(FrameTimeDiagnosticsPlugin::default())
+        .insert_resource(ClearColor(COLOR_BACKGROUND))
+        .insert_resource(Msaa { samples: 1 })
+        .add_plugin(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
+        .insert_resource(RapierConfiguration {
+            gravity: Vec2::ZERO,
+            ..default()
+        })
+        .add_event::<GameOverEvent>()
+        .add_startup_system(setup)
+        .add_startup_system(start_background_audio)
+        .add_startup_system(configure_visuals)
+        .add_system(player_movement)
+        .add_system_set(
+            SystemSet::new()
+                .with_run_criteria(FixedTimestep::step(10.0))
+                .with_system(spawn_enemy_group),
+        )
+        .add_system(enemy_movement)
+        .add_system(update_game_time)
+        .add_system(update_fps)
+        .add_system(update_player_health)
+        .add_system(player_contact)
+        .add_system(handle_game_over)
+        .run();
 }
